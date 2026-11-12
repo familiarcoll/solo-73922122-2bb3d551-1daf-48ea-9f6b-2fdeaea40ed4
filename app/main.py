@@ -1,4 +1,4 @@
-"""FastAPI application: OCR page writes, accent-aware search and live rebuild."""
+"""FastAPI application: OCR page writes, accent-aware search, live rebuild and OAI-PMH harvesting."""
 
 from __future__ import annotations
 
@@ -15,7 +15,21 @@ from pydantic import BaseModel, ConfigDict, Field
 from .accents import AccentPolicy
 from .archive import delete_page, get_page, search, upsert_page
 from .config import SETTINGS
-from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db
+from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db, utc_now
+from .harvest import (
+    cancel_local_harvests,
+    harvest_progress,
+    start_harvest_thread,
+)
+from .harvest_store import (
+    claim_harvest,
+    finish_harvest,
+    get_active_harvest,
+    get_catalog,
+    get_harvest_job,
+    list_harvest_jobs,
+)
+from .oai import format_utc_second, parse_utc_second
 from .rebuild import cancel_local_rebuilds, start_rebuild_thread
 
 
@@ -48,6 +62,43 @@ page corrections and an online, background index rebuild.
   both API worker processes.
 * A failed or interrupted rebuild leaves the previous generation active. The
   committed pages and change log are durable, so a restart can rebuild again.
+
+### OAI-PMH cataloguing harvest
+
+Cataloguers fill citable `dc:title` / `dc:creator` metadata onto OCR pages.
+The configured source (the bundled local demo OAI-PMH service in Compose) is
+harvested with `ListRecords`, `metadataPrefix=oai_dc`, over a **closed UTC
+second interval** (`from`/`until` are both inclusive). Each OAI `identifier`
+is the archive page ID.
+
+* `POST /api/harvests` starts a background job. A repeated trigger while one
+  is active returns the **same job**; the two API processes can run only one
+  harvest at a time thanks to a partial unique index.
+* Every full-page catalog change and the resumption cursor commit in one
+  short transaction. A stream break, bad XML or process exit never leaves a
+  half-applied page; retriggering the same interval resumes the interrupted
+  job from its saved cursor.
+* Network waits happen **outside** database write transactions, so OCR
+  corrections (`PUT /api/pages/...`) keep committing during a harvest.
+* Deleted records only withdraw cataloguing (a `withdrawn` tombstone that
+  keeps its deletion time); OCR text is never modified or removed.
+* An expired/rejected resumption token re-harvests the original interval.
+  Datestamp arbitration then makes the replay safe: older records are
+  skipped, equal datestamp + equal content is a no-op, and equal datestamp +
+  different content fails the whole job with a page-level error. Old records
+  can never revive a tombstone.
+* Read per-page cataloguing at `GET /api/pages/{page_id}/catalog` and job
+  progress at `GET /api/harvests` / `GET /api/harvests/{job_id}`.
+
+The `scenario` field drives the bundled demo source from Swagger:
+
+| Scenario | What it demonstrates |
+|---|---|
+| (omit) | Normal paged harvest with one deleted record. |
+| `broken_stream` | One truncated XML page; the job interrupts without a half page and a retrigger resumes to completion. |
+| `expired_token` | The resumption token is rejected once; the original interval is re-harvested and deduplicated by datestamp. |
+| `replay_old` | An older deleted record is replayed after a newer one; the tombstone/active state is not revived. |
+| `conflict` | Same datestamp, different content; the job fails at page level instead of overwriting. |
 
 ### Two-minute Swagger demo
 
@@ -149,21 +200,85 @@ class RebuildRequest(BaseModel):
     )
 
 
+class HarvestRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Harvest a UTC-second closed interval",
+                    "value": {
+                        "from": "2026-01-01T00:00:00Z",
+                        "until": "2026-12-31T23:59:59Z",
+                    },
+                },
+                {
+                    "summary": "Demo: truncated stream then resume on retrigger",
+                    "value": {
+                        "until": "2026-12-31T23:59:59Z",
+                        "scenario": "broken_stream",
+                    },
+                },
+                {
+                    "summary": "Demo: expired resumption token forces interval re-harvest",
+                    "value": {
+                        "until": "2026-12-31T23:59:59Z",
+                        "scenario": "expired_token",
+                    },
+                },
+                {
+                    "summary": "Demo: replay an old record after a deletion",
+                    "value": {
+                        "until": "2026-12-31T23:59:59Z",
+                        "scenario": "replay_old",
+                    },
+                },
+            ]
+        },
+    )
+
+    from_datestamp: str | None = Field(
+        default=None,
+        alias="from",
+        validation_alias="from",
+        serialization_alias="from",
+        description="Inclusive UTC OAI-PMH `from` bound, second granularity (e.g. 2026-01-01T00:00:00Z).",
+    )
+    until_datestamp: str = Field(
+        ...,
+        alias="until",
+        validation_alias="until",
+        serialization_alias="until",
+        description="Inclusive UTC OAI-PMH `until` bound, second granularity.",
+    )
+    scenario: str | None = Field(
+        default=None,
+        description=(
+            "Optional demo-source scenario passed as an OAI-ignored parameter: "
+            "`broken_stream`, `expired_token` or `replay_old`."
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     logger.info("database ready at startup")
     yield
     cancel_local_rebuilds()
+    cancel_local_harvests()
 
 
 app = FastAPI(
     title="OCR Accent-Aware Archive Search",
-    version="1.0.0",
+    version="1.1.0",
     description=APP_DESCRIPTION,
     lifespan=lifespan,
     openapi_tags=[
         {"name": "pages", "description": "Transactional OCR page writes and deletes."},
+        {"name": "catalog", "description": "Citable cataloguing (OAI-PMH dc:title/dc:creator) per page."},
+        {"name": "harvest", "description": "OAI-PMH ListRecords harvesting with resumable jobs."},
         {"name": "search", "description": "Word search over the active FTS5 generation."},
         {
             "name": "index",
@@ -493,3 +608,128 @@ def index_job(
     if job is None:
         raise HTTPException(status_code=404, detail="rebuild job not found")
     return job
+
+
+def _validate_interval(from_datestamp: str | None, until_datestamp: str) -> tuple[str | None, str]:
+    try:
+        until_text = format_utc_second(parse_utc_second(until_datestamp))
+        from_text = (
+            format_utc_second(parse_utc_second(from_datestamp))
+            if from_datestamp is not None
+            else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if from_text is not None and from_text > until_text:
+        raise HTTPException(
+            status_code=422,
+            detail="`from` must not be later than `until` (inclusive UTC-second interval)",
+        )
+    return from_text, until_text
+
+
+@app.post(
+    "/api/harvests",
+    tags=["harvest"],
+    status_code=202,
+    summary="Start (or reuse/resume) an OAI-PMH ListRecords harvest for a UTC-second interval",
+    response_description=(
+        "The newly queued job, the resumed interrupted job, or the already-running job. "
+        "Repeated triggers for the same source return the current task."
+    ),
+)
+def trigger_harvest(payload: Annotated[HarvestRequest, Body()]) -> dict:
+    from_datestamp, until_datestamp = _validate_interval(
+        payload.from_datestamp, payload.until_datestamp
+    )
+    result = claim_harvest(
+        source_url=SETTINGS.oai_base_url,
+        metadata_prefix=SETTINGS.oai_metadata_prefix,
+        from_datestamp=from_datestamp,
+        until_datestamp=until_datestamp,
+        scenario=payload.scenario,
+    )
+
+    worker_token = result.pop("worker_token", None)
+    if worker_token:
+        job = result["job"]
+        try:
+            start_harvest_thread(
+                job_id=job["job_id"],
+                claim_token=worker_token,
+                source_url=job["source_url"],
+                metadata_prefix=job["metadata_prefix"],
+                from_datestamp=job["from_datestamp"],
+                until_datestamp=job["until_datestamp"],
+                scenario=job["scenario"],
+            )
+        except Exception as exc:  # pragma: no cover - thread start failure
+            finish_harvest(
+                job["job_id"],
+                worker_token,
+                state="failed",
+                error=f"could not start harvest worker: {exc}",
+            )
+            raise HTTPException(status_code=503, detail="could not start harvest worker") from exc
+    return result
+
+
+@app.get(
+    "/api/harvests",
+    tags=["harvest"],
+    summary="List harvest jobs and the currently active one, with live progress",
+)
+def harvests(
+    limit: Annotated[int, Query(ge=1, le=100, description="Maximum jobs to return.")] = 20,
+) -> dict:
+    jobs = [harvest_progress(job) for job in list_harvest_jobs(limit=limit)]
+    return {
+        "source_url": SETTINGS.oai_base_url,
+        "metadata_prefix": SETTINGS.oai_metadata_prefix,
+        "active_harvest": harvest_progress(get_active_harvest()) if get_active_harvest() else None,
+        "jobs": jobs,
+        "server_time": utc_now(),
+    }
+
+
+@app.get(
+    "/api/harvests/{job_id}",
+    tags=["harvest"],
+    summary="Get one harvest job, its progress counters and recent page errors",
+)
+def harvest_status(
+    job_id: Annotated[str, Path(min_length=1, description="Harvest job UUID.")],
+) -> dict:
+    job = get_harvest_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="harvest job not found")
+    return harvest_progress(job)
+
+
+@app.get(
+    "/api/pages/{page_id}/catalog",
+    tags=["catalog"],
+    summary="Read the citable cataloguing (titles, creators) harvested for one page",
+    response_description=(
+        "Stored dc:title/dc:creator values and record datestamp. A withdrawn page "
+        "returns status `withdrawn` with empty title/creator lists and the deletion time."
+    ),
+)
+def read_catalog(
+    page_id: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=512,
+            description="OAI identifier / OCR page ID, e.g. `ocr-001`.",
+            examples=["ocr-001"],
+        ),
+    ],
+) -> dict:
+    catalog = get_catalog(page_id)
+    if catalog is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no cataloguing harvested for this page yet",
+        )
+    return catalog

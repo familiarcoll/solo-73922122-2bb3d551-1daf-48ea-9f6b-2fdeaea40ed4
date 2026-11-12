@@ -1,4 +1,30 @@
 services:
+  demo-oai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ocr-accent-archive:latest
+    command:
+      - python
+      - -u
+      - demo_oai/server.py
+    environment:
+      DEMO_OAI_HOST: 0.0.0.0
+      DEMO_OAI_PORT: "8010"
+    ports:
+      - "${DEMO_OAI_PORT:-8010}:8010"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/oai?verb=Identify', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
   api:
     build:
       context: .
@@ -18,6 +44,12 @@ services:
       - "${API_PORT:-8000}:8000"
     environment:
       ARCHIVE_DB_PATH: /data/archive.db
+      # Fixed, configured OAI-PMH source: the bundled local demo source.
+      OAI_BASE_URL: http://demo-oai:8010/oai
+      OAI_METADATA_PREFIX: oai_dc
+      OAI_TIMEOUT_SECONDS: "${OAI_TIMEOUT_SECONDS:-20}"
+      HARVEST_LEASE_SECONDS: "${HARVEST_LEASE_SECONDS:-20}"
+      HARVEST_PAGE_SIZE: "${HARVEST_PAGE_SIZE:-100}"
       REBUILD_LEASE_SECONDS: "${REBUILD_LEASE_SECONDS:-20}"
       REBUILD_BATCH_SIZE: "${REBUILD_BATCH_SIZE:-500}"
       # Set to e.g. 250 for a visible live-rebuild demonstration.
@@ -25,6 +57,9 @@ services:
       DB_BUSY_TIMEOUT_SECONDS: "${DB_BUSY_TIMEOUT_SECONDS:-30}"
     volumes:
       - archive-data:/data
+    depends_on:
+      demo-oai:
+        condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 10s
     healthcheck:

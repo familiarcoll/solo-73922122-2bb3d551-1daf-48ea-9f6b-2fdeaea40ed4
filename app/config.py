@@ -28,6 +28,11 @@ class Settings:
     rebuild_batch_size: int = 500
     rebuild_batch_delay_ms: int = 0
     db_busy_timeout_seconds: float = 30.0
+    oai_base_url: str = "http://127.0.0.1:8010/oai"
+    oai_metadata_prefix: str = "oai_dc"
+    oai_timeout_seconds: float = 20.0
+    harvest_lease_seconds: float = 30.0
+    harvest_page_size: int = 100
 
 
 def get_settings() -> Settings:
@@ -38,6 +43,16 @@ def get_settings() -> Settings:
         rebuild_batch_size=max(1, _env_int("REBUILD_BATCH_SIZE", 500)),
         rebuild_batch_delay_ms=max(0, _env_int("REBUILD_BATCH_DELAY_MS", 0)),
         db_busy_timeout_seconds=max(1.0, _env_float("DB_BUSY_TIMEOUT_SECONDS", 30.0)),
+        oai_base_url=(
+            os.environ.get("OAI_BASE_URL", "http://127.0.0.1:8010/oai").strip()
+            or "http://127.0.0.1:8010/oai"
+        ),
+        oai_metadata_prefix=(
+            os.environ.get("OAI_METADATA_PREFIX", "oai_dc").strip() or "oai_dc"
+        ),
+        oai_timeout_seconds=max(1.0, _env_float("OAI_TIMEOUT_SECONDS", 20.0)),
+        harvest_lease_seconds=max(1.0, _env_float("HARVEST_LEASE_SECONDS", 30.0)),
+        harvest_page_size=max(1, _env_int("HARVEST_PAGE_SIZE", 100)),
     )
 
 

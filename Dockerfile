@@ -11,6 +11,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY demo_oai ./demo_oai
 
 RUN mkdir -p /data
 

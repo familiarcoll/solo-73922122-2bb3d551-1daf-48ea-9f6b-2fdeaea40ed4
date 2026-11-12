@@ -15,6 +15,7 @@ from .config import SETTINGS
 from .accents import VALID_POLICIES
 
 ACTIVE_JOB_STATES = ("queued", "building", "catching_up", "activating")
+ACTIVE_HARVEST_STATES = ("queued", "running")
 FTS_NAME_RE = re.compile(r"^fts_gen_\d+$")
 
 SCHEMA_SQL = """
@@ -84,6 +85,63 @@ CREATE TABLE IF NOT EXISTS rebuild_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rebuild_one_active
 ON rebuild_jobs((1))
 WHERE state IN ('queued', 'building', 'catching_up', 'activating');
+
+CREATE TABLE IF NOT EXISTS catalog (
+    page_id TEXT PRIMARY KEY,
+    titles TEXT NOT NULL DEFAULT '[]',
+    creators TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL,
+    record_datestamp TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'withdrawn')),
+    first_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    harvest_job_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS harvest_jobs (
+    id TEXT PRIMARY KEY,
+    source_url TEXT NOT NULL,
+    metadata_prefix TEXT NOT NULL,
+    from_datestamp TEXT,
+    until_datestamp TEXT NOT NULL,
+    scenario TEXT,
+    state TEXT NOT NULL,
+    claim_token TEXT NOT NULL,
+    owner_host TEXT,
+    owner_pid INTEGER,
+    owner_proc_start TEXT,
+    created_at TEXT NOT NULL,
+    created_epoch REAL NOT NULL,
+    started_at TEXT,
+    heartbeat_at REAL,
+    finished_at TEXT,
+    resumption_token TEXT,
+    last_identifier TEXT,
+    requests_made INTEGER NOT NULL DEFAULT 0,
+    records_seen INTEGER NOT NULL DEFAULT 0,
+    records_applied INTEGER NOT NULL DEFAULT 0,
+    records_skipped INTEGER NOT NULL DEFAULT 0,
+    records_withdrawn INTEGER NOT NULL DEFAULT 0,
+    restarts INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    message TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_harvest_one_active
+ON harvest_jobs((1))
+WHERE state IN ('queued', 'running');
+
+CREATE TABLE IF NOT EXISTS harvest_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    page_id TEXT NOT NULL,
+    datestamp TEXT,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_harvest_errors_job ON harvest_errors(job_id, id);
 """
 
 
@@ -257,6 +315,7 @@ def init_db() -> None:
         # If a previous process disappeared, its job becomes immediately
         # retriggerable on startup.  The live index was never touched.
         _mark_orphaned_owner_jobs(conn)
+        _mark_orphaned_harvest_jobs(conn)
 
         conn.commit()
     except Exception:
@@ -290,6 +349,45 @@ def _mark_orphaned_owner_jobs(conn: sqlite3.Connection) -> None:
                 finished_at=now,
             )
 
+
+def _owner_is_gone(row: sqlite3.Row, host: str) -> bool:
+    if row["owner_host"] != host:
+        return True
+    if not row["owner_pid"]:
+        return True
+    pid = int(row["owner_pid"])
+    if not pid_exists(pid):
+        return True
+    if row["owner_proc_start"] and process_start_token(pid) != row["owner_proc_start"]:
+        return True
+    return False
+
+
+def _mark_orphaned_harvest_jobs(conn: sqlite3.Connection) -> None:
+    """Interrupt harvests whose owner process/container is gone.
+
+    Already-applied catalog rows stay committed; the job can be retriggered and
+    resumes from the persisted resumption token (or re-harvests the interval).
+    """
+
+    host = socket.gethostname()
+    rows = conn.execute(
+        "SELECT id, owner_host, owner_pid, owner_proc_start FROM harvest_jobs "
+        "WHERE state IN ('queued', 'running')"
+    ).fetchall()
+    now = utc_now()
+    for row in rows:
+        if _owner_is_gone(row, host):
+            conn.execute(
+                """
+                UPDATE harvest_jobs
+                   SET state = 'interrupted', finished_at = ?, heartbeat_at = ?,
+                       error = COALESCE(error, 'harvest process stopped before completion'),
+                       message = 'resume by retriggering the same interval'
+                 WHERE id = ? AND state IN ('queued', 'running')
+                """,
+                (now, time.time(), row["id"]),
+            )
 
 def _mark_job_failed(
     conn: sqlite3.Connection,
